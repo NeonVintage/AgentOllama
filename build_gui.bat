@@ -39,18 +39,14 @@ if %errorlevel% neq 0 (
 
 echo Compiler: cl.exe found
 
-:: Find vcpkg - check environment variable first, then common locations
-if defined VCPKG_ROOT (
-    if exist "%VCPKG_ROOT%\vcpkg.exe" (
-        echo Found vcpkg from VCPKG_ROOT environment variable
-        goto :vcpkg_found
-    )
-)
-
+:: Find vcpkg - check common locations first (they're more reliable than VS bundled vcpkg)
 set "VCPKG_ROOT="
 
-:: Check common locations
+:: Check common locations - include additional D: paths
 for %%p in (
+    "D:\Programs\vcpkg"
+    "D:\vcpkg"
+    "D:\Programs\vcpkg-master"
     "C:\vcpkg"
     "C:\src\vcpkg"
     "%USERPROFILE%\vcpkg"
@@ -58,9 +54,6 @@ for %%p in (
     "C:\dev\vcpkg"
     "C:\tools\vcpkg"
     "C:\Users\%USERNAME%\vcpkg"
-    "D:\vcpkg"
-    "D:\Programs\vcpkg"
-    "D:\Programs\vcpkg-master"
     "%LOCALAPPDATA%\vcpkg"
     "%ProgramFiles%\vcpkg"
     "%ProgramFiles(x86)%\vcpkg"

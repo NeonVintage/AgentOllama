@@ -71,49 +71,58 @@ std::string Agent::getExistingFilesContext() const {
         return "";
     }
     
-    context << "\n\n--- EXISTING FILES IN PROJECT ---\n";
-    context << "These files already exist. When modifying, output the COMPLETE updated file.\n\n";
+    context << "\n\n=== EXISTING PROJECT FILES ===\n";
+    context << "Below are the current files. To modify any file, you MUST output the COMPLETE updated content.\n";
+    context << "Use the format: FILE: filename.ext followed by code block with FULL content.\n\n";
     
     for (const auto& [path, content] : existingFiles) {
-        context << "FILE: " << path << "\n```\n" << content << "\n```\n\n";
+        context << "CURRENT FILE: " << path << " (" << content.length() << " bytes)\n```\n" << content << "\n```\n\n";
     }
     
-    context << "--- END EXISTING FILES ---\n";
+    context << "=== END EXISTING FILES ===\n";
+    context << "IMPORTANT: When modifying files above, output the ENTIRE file with all changes included.\n";
+    context << "When creating NEW files, use FILE: newfilename.ext format.\n";
     
     return context.str();
 }
 
 std::string Agent::buildSystemPrompt() const {
-    return R"(You are a code generation assistant. You create and modify files.
+    return R"(You are a code generation assistant that creates and modifies files.
 
-CRITICAL: You MUST output files in this EXACT format - no exceptions:
+OUTPUT FORMAT - You MUST use this EXACT format for EVERY file:
 
 FILE: index.html
 ```html
 <!DOCTYPE html>
 <html>
-...content...
+<head>...</head>
+<body>...</body>
 </html>
 ```
 
-FILE: styles.css
-```css
-body {
-    ...styles...
-}
+FILE: about.html
+```html
+<!DOCTYPE html>
+...complete file content...
 ```
 
-STRICT RULES:
-1. EVERY file MUST start with "FILE: filename.ext" on its own line
-2. The code block MUST come immediately after
-3. Output the COMPLETE file content, not just changes
-4. When modifying existing files, include ALL the original content plus your changes
-5. If multiple files need changes, output ALL of them
-6. Do NOT skip any files - if styles.css exists and needs updating, output it
+CRITICAL RULES:
+1. Start each file with "FILE: filename.ext" on its own line
+2. Follow immediately with a code block containing the COMPLETE file
+3. NEVER output partial files or diffs - always the ENTIRE file content
+4. When modifying: output the FULL updated file, not just the changed parts
+5. When creating new pages: output EACH new file separately with FILE: marker
+6. If user asks for links/navigation: update ALL pages that need the links
+
+WHEN USER ASKS FOR NEW PAGES OR LINKS:
+- Create each new HTML file with FILE: marker
+- Update index.html to include links to new pages
+- Include navigation in ALL pages
+- Output ALL files that need changes
 
 Working directory: )" + fileManager_.getWorkingDirectory() + R"(
 
-When existing files are provided, output updated versions of ALL files that need changes.)";
+Remember: Output COMPLETE files. Every file needs FILE: marker followed by code block.)";
 }
 
 std::string Agent::trimString(const std::string& str) const {
@@ -178,6 +187,7 @@ bool Agent::looksLikeFilename(const std::string& text) const {
 
 std::vector<ParsedFile> Agent::parseFilesFromResponse(const std::string& response) const {
     std::vector<ParsedFile> files;
+    std::map<std::string, size_t> fileIndexByName;  // Track files by name to deduplicate
     
     std::istringstream stream(response);
     std::string line;
@@ -319,11 +329,22 @@ std::vector<ParsedFile> Agent::parseFilesFromResponse(const std::string& respons
                         file.language = filename.substr(dotPos + 1);
                     }
                     
-                    if (verbose_) {
-                        std::cout << "[Parser] Found file: " << filename << " (" << file.content.length() << " bytes)" << std::endl;
+                    // Check for duplicate filename - keep the latest version
+                    auto it = fileIndexByName.find(filename);
+                    if (it != fileIndexByName.end()) {
+                        // Replace existing file with newer version
+                        files[it->second] = file;
+                        if (verbose_) {
+                            outputMessage("[Parser] Updated file: " + filename + " (" + std::to_string(file.content.length()) + " bytes) - replacing previous version");
+                        }
+                    } else {
+                        // New file
+                        fileIndexByName[filename] = files.size();
+                        files.push_back(file);
+                        if (verbose_) {
+                            outputMessage("[Parser] Found file: " + filename + " (" + std::to_string(file.content.length()) + " bytes)");
+                        }
                     }
-                    
-                    files.push_back(file);
                     codeBlockCount++;
                 }
                 
@@ -358,7 +379,7 @@ std::vector<ParsedFile> Agent::parseFilesFromResponse(const std::string& respons
                     if (looksLikeFilename(possibleFile)) {
                         pendingFilename = possibleFile;
                         if (verbose_) {
-                            std::cout << "[Parser] Found FILE: marker -> " << pendingFilename << std::endl;
+                            outputMessage("[Parser] Found FILE: marker -> " + pendingFilename);
                         }
                     }
                 }
@@ -369,7 +390,7 @@ std::vector<ParsedFile> Agent::parseFilesFromResponse(const std::string& respons
                 if (trimmedLine.length() < 100) {
                     pendingFilename = extracted;
                     if (verbose_) {
-                        std::cout << "[Parser] Found filename pattern -> " << pendingFilename << std::endl;
+                        outputMessage("[Parser] Found filename pattern -> " + pendingFilename);
                     }
                 }
             }
@@ -377,7 +398,12 @@ std::vector<ParsedFile> Agent::parseFilesFromResponse(const std::string& respons
     }
     
     if (verbose_ && files.empty()) {
-        std::cout << "[Parser] No files detected. Code blocks found: " << codeBlockCount << std::endl;
+        outputMessage("[Parser] No files detected. Code blocks found: " + std::to_string(codeBlockCount));
+    }
+    
+    // Check if model seems to be ignoring instructions
+    if (verbose_ && !files.empty()) {
+        outputMessage("[Parser] Total unique files: " + std::to_string(files.size()));
     }
     
     return files;
@@ -386,15 +412,53 @@ std::vector<ParsedFile> Agent::parseFilesFromResponse(const std::string& respons
 bool Agent::executeFileCreation(const std::vector<ParsedFile>& files) {
     createdFiles_.clear();
     bool allSuccess = true;
+    std::string workDir = fileManager_.getWorkingDirectory();
+    
+    outputMessage("[Write] Target directory: " + workDir);
     
     for (const auto& file : files) {
-        printStatus("Creating file: " + file.filename);
+        std::string fullPath = workDir + "/" + file.filename;
+        // Normalize path separators for Windows
+        std::replace(fullPath.begin(), fullPath.end(), '/', '\\');
+        
+        // Check if file exists and get old size
+        std::string existingContent = fileManager_.readFile(file.filename);
+        bool fileExists = !existingContent.empty();
+        
+        outputMessage("[Write] " + file.filename + ":");
+        outputMessage("        Full path: " + fullPath);
+        outputMessage("        New content: " + std::to_string(file.content.length()) + " bytes");
+        if (fileExists) {
+            outputMessage("        Old content: " + std::to_string(existingContent.length()) + " bytes");
+            if (existingContent == file.content) {
+                outputMessage("        WARNING: Content unchanged!");
+            }
+        } else {
+            outputMessage("        (new file)");
+        }
+        
+        if (verbose_) {
+            // Show first 200 chars of content being written
+            std::string preview = file.content.substr(0, 200);
+            if (file.content.length() > 200) preview += "...";
+            outputMessage("        Preview: " + preview);
+        }
         
         if (fileManager_.createFile(file.filename, file.content)) {
             createdFiles_.push_back(file.filename);
-            std::cout << "  [+] Created: " << file.filename << std::endl;
+            
+            // Verify the write
+            std::string verifyContent = fileManager_.readFile(file.filename);
+            if (verifyContent == file.content) {
+                outputMessage("  [+] SUCCESS: " + file.filename + " (" + std::to_string(file.content.length()) + " bytes written)");
+            } else if (verifyContent.empty()) {
+                outputMessage("  [!] VERIFY FAILED: File appears empty after write!");
+                allSuccess = false;
+            } else {
+                outputMessage("  [?] PARTIAL: Written " + std::to_string(verifyContent.length()) + " of " + std::to_string(file.content.length()) + " bytes");
+            }
         } else {
-            std::cerr << "  [!] Failed to create: " << file.filename << " - " << fileManager_.getLastError() << std::endl;
+            outputMessage("  [!] FAILED: " + file.filename + " - " + fileManager_.getLastError());
             allSuccess = false;
         }
     }
@@ -427,9 +491,21 @@ std::string Agent::extractExplanation(const std::string& response) const {
     return explanation;
 }
 
+void Agent::setOutputCallback(OutputCallback callback) {
+    outputCallback_ = callback;
+}
+
+void Agent::outputMessage(const std::string& message) const {
+    if (outputCallback_) {
+        outputCallback_(message);
+    } else {
+        std::cout << message << std::endl;
+    }
+}
+
 void Agent::printStatus(const std::string& message) const {
     if (verbose_) {
-        std::cout << "[Agent] " << message << std::endl;
+        outputMessage("[Agent] " + message);
     }
 }
 
@@ -446,7 +522,14 @@ bool Agent::processRequest(const std::string& userRequest) {
     std::string fullRequest = userRequest;
     if (!existingFiles.empty()) {
         fullRequest = userRequest + existingFiles;
-        std::cout << "[i] Including existing project files in context..." << std::endl;
+        outputMessage("[i] Including existing project files in context...");
+        if (verbose_) {
+            outputMessage("[i] Context size: " + std::to_string(existingFiles.length()) + " bytes");
+        }
+    } else {
+        if (verbose_) {
+            outputMessage("[i] No existing files found in: " + fileManager_.getWorkingDirectory());
+        }
     }
     
     printStatus("Sending request to Ollama...");
@@ -454,7 +537,7 @@ bool Agent::processRequest(const std::string& userRequest) {
     
     if (response.empty()) {
         lastResponse_ = "Error: Failed to get response from Ollama. " + client_.getLastError();
-        std::cerr << lastResponse_ << std::endl;
+        outputMessage(lastResponse_);
         return false;
     }
     
@@ -463,15 +546,15 @@ bool Agent::processRequest(const std::string& userRequest) {
     
     // Debug: show raw response in verbose mode
     if (verbose_) {
-        std::cout << "\n=== RAW RESPONSE ===\n" << response << "\n=== END RESPONSE ===\n" << std::endl;
+        outputMessage("\n=== RAW RESPONSE ===\n" + response + "\n=== END RESPONSE ===\n");
     }
     
     // Parse files from response
     std::vector<ParsedFile> files = parseFilesFromResponse(response);
     
     if (files.empty()) {
-        std::cout << "\n" << response << std::endl;
-        std::cout << "\n[No files detected in response]" << std::endl;
+        outputMessage("\n" + response);
+        outputMessage("\n[No files detected in response]");
         
         // Count code blocks to help debug
         int codeBlocks = 0;
@@ -483,26 +566,66 @@ bool Agent::processRequest(const std::string& userRequest) {
         codeBlocks /= 2;  // Opening and closing
         
         if (codeBlocks > 0) {
-            std::cout << "[Debug] Found " << codeBlocks << " code block(s) but couldn't extract filenames." << std::endl;
-            std::cout << "[Debug] The model may not be using the expected format." << std::endl;
+            outputMessage("[Debug] Found " + std::to_string(codeBlocks) + " code block(s) but couldn't extract filenames.");
+            outputMessage("[Debug] The model may not be using the expected format.");
         }
-        std::cout << "Tip: Use /verbose for detailed debug output." << std::endl;
+        outputMessage("Tip: Enable verbose mode for detailed debug output.");
         return true;
     }
     
     // Print explanation
     std::string explanation = extractExplanation(response);
     if (!explanation.empty()) {
-        std::cout << "\n" << explanation << std::endl;
+        outputMessage("\n" + explanation);
     }
     
     // Execute file creation
-    std::cout << "\nCreating " << files.size() << " file(s)..." << std::endl;
+    outputMessage("\nCreating " + std::to_string(files.size()) + " file(s)...");
     bool success = executeFileCreation(files);
     
     if (success) {
-        std::cout << "\n[OK] All files created successfully!" << std::endl;
-        std::cout << "Location: " << fileManager_.getWorkingDirectory() << std::endl;
+        outputMessage("\n[OK] All files created successfully!");
+        outputMessage("Location: " + fileManager_.getWorkingDirectory());
+    }
+    
+    // Check if model might have ignored parts of the request
+    std::string lowerRequest = userRequest;
+    std::transform(lowerRequest.begin(), lowerRequest.end(), lowerRequest.begin(), ::tolower);
+    
+    bool expectedCss = (lowerRequest.find("css") != std::string::npos || 
+                        lowerRequest.find("style") != std::string::npos);
+    bool expectedNewPages = (lowerRequest.find("page") != std::string::npos && 
+                            (lowerRequest.find("new") != std::string::npos || 
+                             lowerRequest.find("create") != std::string::npos ||
+                             lowerRequest.find("add") != std::string::npos));
+    bool expectedNav = (lowerRequest.find("nav") != std::string::npos || 
+                       lowerRequest.find("menu") != std::string::npos ||
+                       lowerRequest.find("link") != std::string::npos);
+    
+    bool hasCss = false;
+    bool hasMultipleHtml = false;
+    int htmlCount = 0;
+    for (const auto& f : createdFiles_) {
+        if (f.find(".css") != std::string::npos) hasCss = true;
+        if (f.find(".html") != std::string::npos || f.find(".htm") != std::string::npos) htmlCount++;
+    }
+    hasMultipleHtml = (htmlCount > 1);
+    
+    // Warn if model seems to have ignored the request
+    bool mightHaveIgnored = false;
+    if (expectedCss && !hasCss) {
+        outputMessage("\n[!] WARNING: You asked for CSS/styles but no .css file was created.");
+        mightHaveIgnored = true;
+    }
+    if (expectedNewPages && !hasMultipleHtml && htmlCount <= 1) {
+        outputMessage("[!] WARNING: You asked for new pages but only " + std::to_string(htmlCount) + " HTML file(s) created.");
+        mightHaveIgnored = true;
+    }
+    
+    if (mightHaveIgnored) {
+        outputMessage("[!] The model may not have followed your instructions properly.");
+        outputMessage("[!] TIP: Try a larger model (llama3, mistral, codellama) for better results.");
+        outputMessage("[!] Small models like gemma:1b often struggle with multi-step requests.");
     }
     
     // Update context summary

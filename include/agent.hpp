@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <regex>
+#include <functional>
 
 namespace ollama_agent {
 
@@ -14,6 +15,9 @@ struct ParsedFile {
     std::string content;
     std::string language;
 };
+
+// Callback type for output messages
+using OutputCallback = std::function<void(const std::string& message)>;
 
 class Agent {
 public:
@@ -31,6 +35,9 @@ public:
     // Set verbose mode for debugging
     void setVerbose(bool verbose);
     
+    // Set output callback for GUI integration
+    void setOutputCallback(OutputCallback callback);
+    
     // Get conversation history summary
     std::string getContextSummary() const;
 
@@ -41,6 +48,7 @@ private:
     std::vector<std::string> createdFiles_;
     bool verbose_ = false;
     std::string contextSummary_;
+    OutputCallback outputCallback_;
     
     // Build the system prompt for the agent
     std::string buildSystemPrompt() const;
@@ -68,6 +76,9 @@ private:
     
     // Read existing files and build context for the LLM
     std::string getExistingFilesContext() const;
+    
+    // Output a message (to callback if set, otherwise stdout)
+    void outputMessage(const std::string& message) const;
 };
 
 } // namespace ollama_agent

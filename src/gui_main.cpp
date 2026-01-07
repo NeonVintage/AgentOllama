@@ -609,6 +609,43 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             PostQuitMessage(0);
             break;
 
+        case WM_USER + 1: {
+            // Handle async output message from agent callback
+            std::wstring* msg = (std::wstring*)lParam;
+            if (msg) {
+                AppendOutput(*msg);
+                delete msg;
+            }
+            break;
+        }
+
+        case WM_USER + 2: {
+            // Handle request completion
+            bool success = (wParam != 0);
+            std::vector<std::string>* files = (std::vector<std::string>*)lParam;
+            
+            AppendOutput(L"\r\n────────────────────────────────────\r\n");
+            if (files && !files->empty()) {
+                AppendOutput(L"Files created/updated:\r\n");
+                for (const auto& f : *files) {
+                    AppendOutput(L"  ✓ " + StringToWString(f) + L"\r\n");
+                }
+                AppendOutput(L"\r\n[OK] Operation complete!\r\n");
+            } else if (!success) {
+                AppendOutput(L"[!] Operation failed - check verbose output for details\r\n");
+            } else {
+                AppendOutput(L"[i] No files were created/modified\r\n");
+            }
+            AppendOutput(L"────────────────────────────────────\r\n");
+            
+            if (files) delete files;
+            g_isProcessing = false;
+            
+            // Refresh file list
+            RefreshFileList();
+            break;
+        }
+
         default:
             return DefWindowProc(hWnd, message, wParam, lParam);
     }
@@ -706,6 +743,22 @@ void InitializeOllama() {
     g_fileManager = std::make_unique<ollama_agent::FileManager>(WStringToString(currentDir));
     
     g_agent = std::make_unique<ollama_agent::Agent>(*g_client, *g_fileManager);
+    
+    // Set output callback for verbose mode and status messages
+    g_agent->setOutputCallback([](const std::string& message) {
+        std::lock_guard<std::mutex> lock(g_outputMutex);
+        std::wstring wmsg = StringToWString(message);
+        // Normalize line endings for Windows
+        std::wstring normalized;
+        for (size_t i = 0; i < wmsg.size(); i++) {
+            if (wmsg[i] == L'\n' && (i == 0 || wmsg[i-1] != L'\r')) {
+                normalized += L"\r\n";
+            } else {
+                normalized += wmsg[i];
+            }
+        }
+        PostMessage(g_hWnd, WM_USER + 1, 0, (LPARAM)new std::wstring(normalized));
+    });
 
     if (!g_client->isAvailable()) {
         AppendOutput(L"\r\n[ERROR] Cannot connect to Ollama at 127.0.0.1:11434\r\n\r\n");
@@ -785,28 +838,21 @@ void SendRequest() {
     if (input.find("Type your request") == 0) return;
 
     g_isProcessing = true;
-    AppendOutput(L"\r\n> " + winput + L"\r\n\r\n[...] Processing...\r\n");
+    AppendOutput(L"\r\n────────────────────────────────────\r\n");
+    AppendOutput(L"> " + winput + L"\r\n");
+    AppendOutput(L"────────────────────────────────────\r\n");
+    AppendOutput(L"[...] Processing request...\r\n");
+    if (g_verboseMode) {
+        AppendOutput(L"[Verbose mode ON]\r\n");
+    }
     SetWindowText(g_hInputEdit, L"");
 
     std::thread([input]() {
-        g_agent->processRequest(input);
+        bool success = g_agent->processRequest(input);
         auto files = g_agent->getCreatedFiles();
 
-        {
-            std::lock_guard<std::mutex> lock(g_outputMutex);
-            if (files.empty()) {
-                AppendOutput(L"\r\n" + StringToWString(g_agent->getLastResponse()) + L"\r\n");
-                AppendOutput(L"\r\n[No files detected]\r\n");
-            } else {
-                AppendOutput(L"\r\nFiles:\r\n");
-                for (const auto& f : files) {
-                    AppendOutput(L"  [+] " + StringToWString(f) + L"\r\n");
-                }
-                AppendOutput(L"\r\n[OK] Done!\r\n");
-            }
-        }
-        g_isProcessing = false;
-        PostMessage(g_hWnd, WM_COMMAND, MAKEWPARAM(ID_REFRESH_BUTTON, BN_CLICKED), 0);
+        // Post completion message
+        PostMessage(g_hWnd, WM_USER + 2, success ? 1 : 0, (LPARAM)new std::vector<std::string>(files));
     }).detach();
 }
 
